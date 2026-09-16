@@ -73,12 +73,9 @@ jobs:
             aws opensearch create-domain \
               --domain-name ${{ env.PROJECT_NAME }}-os \
               --engine-version "OpenSearch_2.11" \
-              --node-type t3.small.search \
-              --instance-count 1 \
-              --enable-advanced-security \
-              --master-username admin \
-              --master-password "${{ secrets.OPENSEARCH_PASSWORD }}" \
+              --cluster-config InstanceType=t3.small.search,InstanceCount=1 \
               --ebs-options EBSEnabled=true,VolumeType=gp2,VolumeSize=10 \
+              --access-policies '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"es:*","Resource":"*"}]}' \
               --region ${{ env.AWS_REGION }} \
               || true
             echo "⏳ OpenSearch is starting (may take 10-15 minutes)..."
