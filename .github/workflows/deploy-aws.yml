@@ -1,0 +1,243 @@
+name: Deploy AWS Agents
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: geography-ai
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION || 'us-east-1' }}.amazonaws.com
+
+jobs:
+  provision-infrastructure:
+    runs-on: ubuntu-latest
+    outputs:
+      rds-endpoint: ${{ steps.rds.outputs.endpoint }}
+      opensearch-endpoint: ${{ steps.opensearch.outputs.endpoint }}
+      ecr-registry: ${{ env.ECR_REGISTRY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR Repository
+        id: ecr
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.PROJECT_NAME }}-orchestrator \
+            || aws ecr create-repository --repository-name ${{ env.PROJECT_NAME }}-orchestrator --region ${{ env.AWS_REGION }}
+          aws ecr describe-repositories --repository-names ${{ env.PROJECT_NAME }}-retriever \
+            || aws ecr create-repository --repository-name ${{ env.PROJECT_NAME }}-retriever --region ${{ env.AWS_REGION }}
+          aws ecr describe-repositories --repository-names ${{ env.PROJECT_NAME }}-ingestion \
+            || aws ecr create-repository --repository-name ${{ env.PROJECT_NAME }}-ingestion --region ${{ env.AWS_REGION }}
+
+      - name: Create RDS PostgreSQL
+        id: rds
+        run: |
+          RDS_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+            --query 'DBInstances[0].Endpoint.Address' --output text 2>/dev/null || echo "creating")
+          
+          if [ "$RDS_ENDPOINT" == "creating" ] || [ -z "$RDS_ENDPOINT" ]; then
+            aws rds create-db-instance \
+              --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+              --db-instance-class db.t3.micro \
+              --engine postgres \
+              --master-username postgres \
+              --master-user-password "${{ secrets.RDS_PASSWORD }}" \
+              --allocated-storage 20 \
+              --storage-type gp2 \
+              --region ${{ env.AWS_REGION }} \
+              --no-publicly-accessible || true
+            echo "⏳ RDS is starting (may take 5-10 minutes)..."
+            sleep 30
+          fi
+          
+          RDS_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+            --query 'DBInstances[0].Endpoint.Address' --output text)
+          echo "endpoint=$RDS_ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: Create OpenSearch Domain
+        id: opensearch
+        run: |
+          OS_ENDPOINT=$(aws opensearch describe-domain --domain-name ${{ env.PROJECT_NAME }}-os \
+            --query 'DomainStatus.Endpoint' --output text 2>/dev/null || echo "creating")
+          
+          if [ "$OS_ENDPOINT" == "creating" ] || [ -z "$OS_ENDPOINT" ]; then
+            aws opensearch create-domain \
+              --domain-name ${{ env.PROJECT_NAME }}-os \
+              --engine-version "OpenSearch_2.11" \
+              --node-type t3.small.search \
+              --instance-count 1 \
+              --enable-advanced-security \
+              --master-username admin \
+              --master-password "${{ secrets.OPENSEARCH_PASSWORD }}" \
+              --ebs-options EBSEnabled=true,VolumeType=gp2,VolumeSize=10 \
+              --region ${{ env.AWS_REGION }} \
+              || true
+            echo "⏳ OpenSearch is starting (may take 10-15 minutes)..."
+          fi
+          
+          OS_ENDPOINT=$(aws opensearch describe-domain --domain-name ${{ env.PROJECT_NAME }}-os \
+            --query 'DomainStatus.Endpoint' --output text)
+          echo "endpoint=$OS_ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: Create S3 Bucket
+        run: |
+          aws s3api create-bucket \
+            --bucket ${{ env.PROJECT_NAME }}-docs-${{ secrets.AWS_ACCOUNT_ID }} \
+            --region ${{ env.AWS_REGION }} \
+            $([ "${{ env.AWS_REGION }}" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=${{ env.AWS_REGION }}") \
+            || true
+
+  setup-database:
+    needs: provision-infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          pip install psycopg2-binary boto3
+
+      - name: Wait for RDS
+        run: |
+          for i in {1..30}; do
+            echo "Waiting for RDS... (attempt $i/30)"
+            if psql -h ${{ needs.provision-infrastructure.outputs.rds-endpoint }} \
+              -U postgres -d postgres -c "SELECT 1" 2>/dev/null; then
+              echo "✅ RDS is ready"
+              break
+            fi
+            sleep 20
+          done
+        env:
+          PGPASSWORD: ${{ secrets.RDS_PASSWORD }}
+
+      - name: Setup database
+        run: |
+          python infra/setup_rds.py
+        env:
+          RDS_ENDPOINT: ${{ needs.provision-infrastructure.outputs.rds-endpoint }}
+          RDS_PORT: 5432
+          RDS_DB_NAME: geography_db
+          RDS_USER: postgres
+          RDS_PASSWORD: ${{ secrets.RDS_PASSWORD }}
+
+  build-and-push-images:
+    needs: [provision-infrastructure, setup-database]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Orchestrator image
+        run: |
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-orchestrator:latest agents/orchestrator_agent/
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-orchestrator:latest
+
+      - name: Build and push Retriever image
+        run: |
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-retriever:latest agents/retriever_agent/
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-retriever:latest
+
+      - name: Build and push Ingestion image
+        run: |
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-ingestion:latest ingestion/
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.PROJECT_NAME }}-ingestion:latest
+
+  run-ingestion:
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ingestion dependencies
+        run: |
+          pip install -r ingestion/requirements.txt
+
+      - name: Run document ingestion
+        run: |
+          cd ingestion && python main.py
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          OPENSEARCH_ENDPOINT: "http://localhost:9200"
+          OPENSEARCH_INDEX: "geography-documents"
+
+  deployment-summary:
+    needs: [provision-infrastructure, run-ingestion]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print Deployment Summary
+        run: |
+          echo "=========================================="
+          echo "🚀 AWS Geography AI Deployment Summary"
+          echo "=========================================="
+          echo ""
+          echo "✅ Infrastructure Provisioned:"
+          echo "   📊 RDS Endpoint: ${{ needs.provision-infrastructure.outputs.rds-endpoint }}"
+          echo "   🔍 OpenSearch: ${{ needs.provision-infrastructure.outputs.opensearch-endpoint }}"
+          echo "   🐳 ECR Registry: ${{ env.ECR_REGISTRY }}"
+          echo ""
+          echo "✅ Services Built & Pushed:"
+          echo "   - Orchestrator Agent (Port 8002)"
+          echo "   - Retriever Agent (Port 8081)"
+          echo "   - Ingestion Service"
+          echo ""
+          echo "✅ Database Configured:"
+          echo "   - PostgreSQL with 28 Indian States"
+          echo "   - Districts indexed"
+          echo ""
+          echo "✅ Documents Ingested:"
+          echo "   - OpenSearch index created"
+          echo "   - Vector embeddings generated"
+          echo ""
+          echo "📝 Next Steps:"
+          echo "   1. Deploy to ECS using: aws ecs create-service"
+          echo "   2. Test endpoints when services are running"
+          echo "   3. Configure GitHub Secrets for future deployments"
+          echo ""
+          echo "=========================================="

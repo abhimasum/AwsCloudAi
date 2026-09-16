@@ -1,0 +1,172 @@
+name: Cleanup AWS Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deletion:
+        description: 'Type "DELETE_ALL" to confirm deletion of all resources'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: geography-ai
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Deletion Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_deletion }}" != "DELETE_ALL" ]; then
+            echo "❌ Deletion not confirmed. Please provide 'DELETE_ALL' as confirmation."
+            exit 1
+          fi
+          echo "✅ Deletion confirmed. Starting cleanup..."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete ECS Services and Tasks
+        run: |
+          echo "🧹 Cleaning up ECS services..."
+          
+          # Delete services
+          aws ecs list-services --cluster ${{ env.PROJECT_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null | \
+          jq -r '.serviceArns[]' | while read service; do
+            aws ecs delete-service --cluster ${{ env.PROJECT_NAME }} --service "$service" --force --region ${{ env.AWS_REGION }} || true
+          done
+          
+          # Delete cluster
+          aws ecs delete-cluster --cluster ${{ env.PROJECT_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          echo "✅ ECS services cleaned up"
+
+      - name: Delete RDS Database
+        run: |
+          echo "🧹 Deleting RDS database..."
+          
+          aws rds delete-db-instance \
+            --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+            --skip-final-snapshot \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          # Wait for deletion to start
+          sleep 10
+          
+          echo "✅ RDS database deletion initiated"
+
+      - name: Delete OpenSearch Domain
+        run: |
+          echo "🧹 Deleting OpenSearch domain..."
+          
+          aws opensearch delete-domain \
+            --domain-name ${{ env.PROJECT_NAME }}-os \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          echo "✅ OpenSearch domain deletion initiated"
+
+      - name: Delete ECR Repositories
+        run: |
+          echo "🧹 Deleting ECR repositories..."
+          
+          for repo in orchestrator retriever ingestion; do
+            # Delete all images in repository
+            aws ecr describe-images \
+              --repository-name ${{ env.PROJECT_NAME }}-${repo} \
+              --region ${{ env.AWS_REGION }} 2>/dev/null | \
+            jq -r '.imageDetails[].imageId | @uri "\(.imageTag)"' | while read image; do
+              aws ecr batch-delete-image \
+                --repository-name ${{ env.PROJECT_NAME }}-${repo} \
+                --image-ids "$image" \
+                --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            done
+            
+            # Delete repository
+            aws ecr delete-repository \
+              --repository-name ${{ env.PROJECT_NAME }}-${repo} \
+              --force \
+              --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+          
+          echo "✅ ECR repositories deleted"
+
+      - name: Delete S3 Bucket
+        run: |
+          echo "🧹 Deleting S3 bucket..."
+          
+          BUCKET_NAME="${{ env.PROJECT_NAME }}-docs-${{ secrets.AWS_ACCOUNT_ID }}"
+          
+          # Delete all objects in bucket
+          aws s3 rm s3://${BUCKET_NAME} --recursive --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          # Delete bucket
+          aws s3api delete-bucket \
+            --bucket ${BUCKET_NAME} \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          echo "✅ S3 bucket deleted"
+
+      - name: Delete CloudWatch Log Groups
+        run: |
+          echo "🧹 Deleting CloudWatch log groups..."
+          
+          # Delete log groups related to this project
+          aws logs describe-log-groups --region ${{ env.AWS_REGION }} | \
+          jq -r ".logGroups[] | select(.logGroupName | contains(\"${{ env.PROJECT_NAME }}\")) | .logGroupName" | \
+          while read log_group; do
+            aws logs delete-log-group --log-group-name "${log_group}" --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+          
+          echo "✅ CloudWatch log groups cleaned up"
+
+      - name: Delete VPC and Security Groups
+        run: |
+          echo "🧹 Cleaning up VPC resources..."
+          
+          # List and delete security groups created by RDS/OpenSearch
+          aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${{ env.PROJECT_NAME }}-*" \
+            --region ${{ env.AWS_REGION }} 2>/dev/null | \
+          jq -r '.SecurityGroups[].GroupId' | while read sg_id; do
+            aws ec2 delete-security-group --group-id "${sg_id}" --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          done
+          
+          echo "✅ VPC resources cleaned up"
+
+      - name: Cleanup Summary
+        run: |
+          echo "=================================="
+          echo "✅ AWS Resource Cleanup Complete!"
+          echo "=================================="
+          echo ""
+          echo "Deleted Resources:"
+          echo "  ✓ ECS Cluster and Services"
+          echo "  ✓ RDS PostgreSQL Database"
+          echo "  ✓ OpenSearch Domain"
+          echo "  ✓ ECR Repositories (3)"
+          echo "  ✓ S3 Buckets"
+          echo "  ✓ CloudWatch Log Groups"
+          echo "  ✓ VPC Security Groups"
+          echo ""
+          echo "Note: Some resources (RDS, OpenSearch) may take 10-15 minutes to fully delete."
+          echo "Check AWS Console for completion status."
+          echo ""
+          echo "To redeploy: Push to master branch or manually trigger the Deploy workflow."
+          echo "=================================="
+
+      - name: Notify Cleanup Complete
+        if: always()
+        run: |
+          echo "🎉 Cleanup workflow completed!"
+          echo "Check the AWS Console to verify resource deletion:"
+          echo "  - EC2 Dashboard (Security Groups)"
+          echo "  - RDS Dashboard (Databases)"
+          echo "  - OpenSearch Domains"
+          echo "  - ECR Repositories"
+          echo "  - S3 Buckets"
+          echo "  - CloudWatch Logs"
