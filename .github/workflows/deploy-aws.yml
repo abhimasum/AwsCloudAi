@@ -76,7 +76,10 @@ jobs:
               --cluster-config InstanceType=t3.small.search,InstanceCount=1 \
               --ebs-options EBSEnabled=true,VolumeType=gp2,VolumeSize=10 \
               --access-policies '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:root"},"Action":"es:*","Resource":"arn:aws:es:*:${{ secrets.AWS_ACCOUNT_ID }}:domain/*"}]}' \
-              --advanced-security-options Enabled=true,InternalUserDatabaseEnabled=true,MasterUserOptions={MasterUserName=admin,MasterUserPassword=${{ secrets.OPENSEARCH_PASSWORD }}} \
+              --advanced-security-options '{"Enabled":true,"InternalUserDatabaseEnabled":true,"MasterUserOptions":{"MasterUserName":"admin","MasterUserPassword":"${{ secrets.OPENSEARCH_PASSWORD }}"}}' \
+              --encryption-at-rest-options Enabled=true \
+              --node-to-node-encryption-options Enabled=true \
+              --domain-endpoint-options EnforceHTTPS=true \
               --region ${{ env.AWS_REGION }} \
               || true
             echo "⏳ OpenSearch is starting (may take 10-15 minutes)..."
