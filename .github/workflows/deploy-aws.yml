@@ -54,14 +54,31 @@ jobs:
               --allocated-storage 20 \
               --storage-type gp2 \
               --region ${{ env.AWS_REGION }} \
-              --no-publicly-accessible || true
+              --publicly-accessible || true
             echo "⏳ RDS is starting (may take 5-10 minutes)..."
             sleep 30
+          else
+            # Already exists - ensure it is reachable from GitHub-hosted runners
+            aws rds modify-db-instance \
+              --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+              --publicly-accessible \
+              --apply-immediately || true
           fi
           
           RDS_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
             --query 'DBInstances[0].Endpoint.Address' --output text)
           echo "endpoint=$RDS_ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: Open RDS security group for GitHub Actions runners
+        run: |
+          SG_ID=$(aws rds describe-db-instances --db-instance-identifier ${{ env.PROJECT_NAME }}-db \
+            --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' --output text)
+          
+          # Idempotent: ignore error if the rule already exists
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 5432 --cidr 0.0.0.0/0 \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
 
       - name: Create OpenSearch Domain
         id: opensearch
